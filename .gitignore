@@ -1,0 +1,6 @@
+/dist/
+*.dylib
+*.dll
+*.so
+*.h
+coverage.out
