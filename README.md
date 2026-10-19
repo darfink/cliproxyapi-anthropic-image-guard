@@ -52,6 +52,9 @@ That cost occurs at batch boundaries, not on every turn.
 The model cannot see omitted images unless you provide them again.
 Original files and saved conversation history remain unchanged.
 
+Cache stability applies to the same build and configuration. Go toolchain or architecture changes can change resized image bytes.
+Compatibility tests compare against the original encoder on the same toolchain; they do not guarantee identical bytes across different builds.
+
 The newest image always stays in the request.
 Required computer-tool screenshot objects also stay intact because text cannot replace them without breaking the protocol.
 Very large or protected screenshots can leave less headroom between batches.

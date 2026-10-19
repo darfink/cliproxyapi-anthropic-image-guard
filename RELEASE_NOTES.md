@@ -2,6 +2,7 @@
 
 ## 0.2.0 - Unreleased
 
+- Compare image compatibility against the original encoder on the same toolchain. Test Go 1.26.0 and 1.27.2 in CI.
 - Enable batched image-history eviction by default. No opt-in configuration is necessary.
 - At 20 MiB or 80 images, replace the oldest image blocks with stable text placeholders down to 10 MiB and 40 images.
 - Preserve retained image quality, message positions, tool results, text, and cache markers.

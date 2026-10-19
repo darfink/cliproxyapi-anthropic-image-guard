@@ -1,23 +1,30 @@
 package guard
 
 import (
-	"crypto/sha256"
-	"fmt"
+	"bytes"
+	"encoding/base64"
+	"image"
+	"image/jpeg"
+	"image/png"
 	"testing"
+
+	"github.com/disintegration/imaging"
 )
 
-// Pin v0.1.0 image bytes so parser and memory improvements cannot invalidate
-// existing image prefixes in the provider's prompt cache.
+// Compare against v0.1.0 on the same toolchain so parser and memory improvements
+// cannot invalidate existing image prefixes. Encoded PNG bytes can differ across
+// Go versions, and resampling can differ across architectures, so a hash captured
+// on a developer's machine is not a portable compatibility baseline.
 func TestNormalizationCacheCompatibility(t *testing.T) {
 	for _, tc := range []struct {
-		name, format, encoded, expected string
-		width, height, maxEdge          int
+		name, format, encoded  string
+		width, height, maxEdge int
 	}{
-		{name: "png", format: "png", width: 384, height: 24, maxEdge: 256, expected: "1354fe4caff195bb6bf75c66e95cebef7896f75ca303a7c319f663d0a4672f40"},
-		{name: "jpeg", format: "jpeg", width: 384, height: 24, maxEdge: 256, expected: "23e96a7d52d40bc128ae7e31610b7dec0acf126d821a1f4c0fa13ade710aca1e"},
-		{name: "gif", format: "gif", width: 384, height: 24, maxEdge: 256, expected: "6612b0a8a2c6d4d8454510f8f32f423a2f45886aabf201ce45a956e5ac505efd"},
-		{name: "webp", encoded: "UklGRiQAAABXRUJQVlA4TBcAAAAvf8EFEAdQwaJUuoBhABLC//1SRP9TPwA=", maxEdge: 256, expected: "74c8f7873ba877f7c3fd2d96d400cb33d63a9c1af19605a0d4e828efe5a07718"},
-		{name: "default-cap", format: "png", width: 3520, height: 340, maxEdge: 2000, expected: "b6baaf3c70ccd27e59a25680ffcea6e0dc0aa1bf1fafb284e9941093889b3f7e"},
+		{name: "png", format: "png", width: 384, height: 24, maxEdge: 256},
+		{name: "jpeg", format: "jpeg", width: 384, height: 24, maxEdge: 256},
+		{name: "gif", format: "gif", width: 384, height: 24, maxEdge: 256},
+		{name: "webp", encoded: "UklGRiQAAABXRUJQVlA4TBcAAAAvf8EFEAdQwaJUuoBhABLC//1SRP9TPwA=", maxEdge: 256},
+		{name: "default-cap", format: "png", width: 3520, height: 340, maxEdge: 2000},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := DefaultConfig()
@@ -34,10 +41,41 @@ func TestNormalizationCacheCompatibility(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			got := fmt.Sprintf("%x", sha256.Sum256([]byte(result.data)))
-			if !result.changed || got != tc.expected {
-				t.Fatalf("normalized image bytes changed: %s", got)
+			if !result.changed || result != legacyNormalization(t, encoded, tc.maxEdge) {
+				t.Fatal("normalized image bytes differ from v0.1.0 on this toolchain")
 			}
 		})
 	}
+}
+
+// Keep this reference independent of the production normalization path. It
+// freezes v0.1.0's full-buffer decode, resize, and encoding policy for valid
+// oversized fixtures; safety checks are covered by the other guard tests.
+func legacyNormalization(t testing.TB, encoded string, maxEdge int) normalized {
+	t.Helper()
+	raw, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, format, err := image.DecodeConfig(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := imaging.Decode(bytes.NewReader(raw), imaging.AutoOrientation(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resized := imaging.Fit(decoded, maxEdge, maxEdge, imaging.Lanczos)
+	var output bytes.Buffer
+	if format == "jpeg" {
+		err = jpeg.Encode(&output, resized, &jpeg.Options{Quality: 90})
+	} else {
+		format = "png"
+		encoder := png.Encoder{CompressionLevel: png.DefaultCompression}
+		err = encoder.Encode(&output, resized)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return normalized{data: base64.StdEncoding.EncodeToString(output.Bytes()), format: format, changed: true}
 }
