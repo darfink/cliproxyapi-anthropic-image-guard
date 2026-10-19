@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
@@ -121,6 +122,25 @@ func TestDisabledAndShutdown(t *testing.T) {
 	}
 	if !rpc(t, m, pluginabi.MethodPluginShutdown, nil).OK || m.guard != nil {
 		t.Fatal("shutdown did not release cache")
+	}
+}
+
+func TestHistoryEvictionIsEnabledByDefault(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		m := New()
+		if !register(t, m, "").OK {
+			t.Fatal("registration failed")
+		}
+		block := `{"type":"input_image","image_url":"https://example.invalid/image.png"}`
+		body := []byte(`{"input":[{"role":"user","content":[` + strings.TrimSuffix(strings.Repeat(block+",", 81), ",") + `]}]}`)
+		out := intercept(t, m, pluginapi.RequestInterceptRequest{ToFormat: "claude", Stream: stream, Body: body})
+		if out.Terminate || !json.Valid(out.Body) || strings.Count(string(out.Body), `"type":"input_image"`) != 40 {
+			t.Fatal("default plugin did not evict a batch")
+		}
+		unrelated := intercept(t, m, pluginapi.RequestInterceptRequest{ToFormat: "openai-response", Stream: stream, Body: body})
+		if unrelated.Body != nil || unrelated.Terminate {
+			t.Fatal("history eviction affected another provider")
+		}
 	}
 }
 

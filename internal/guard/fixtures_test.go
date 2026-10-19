@@ -11,6 +11,7 @@ import (
 	"image/gif"
 	"image/jpeg"
 	"image/png"
+	"strings"
 	"testing"
 )
 
@@ -36,6 +37,26 @@ func fixtureImage(t testing.TB, format string, width, height, seed int) string {
 		t.Fatal(err)
 	}
 	return base64.StdEncoding.EncodeToString(out.Bytes())
+}
+
+func fixturePaddedImage(t testing.TB, encodedBytes int) string {
+	t.Helper()
+	raw, err := base64.StdEncoding.DecodeString(fixtureImage(t, "png", 8, 8, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Valid image with trailing bytes: exercise byte budgets without large pixel
+	// allocations or dependencies on a random, hard-to-compress fixture.
+	size := encodedBytes / 4 * 3
+	if size < len(raw) {
+		t.Fatal("padded fixture is too small")
+	}
+	return base64.StdEncoding.EncodeToString(append(raw, make([]byte, size-len(raw))...))
+}
+
+func fixtureImageHistory(block string, count int, suffix string) []byte {
+	return []byte(` { "input" : [{"role":"user","content":[` + strings.TrimSuffix(strings.Repeat(block+",", count), ",") +
+		`,{"type":"input_text","text":"unchanged text"}]}], "tools":[{"name":"unchanged"}], "metadata":{"suffix":"` + suffix + `"} } `)
 }
 
 func fixtureGuard(t testing.TB) *Guard {

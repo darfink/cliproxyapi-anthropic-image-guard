@@ -11,6 +11,7 @@ build:
 
 smoke: build
 	node tools/smoke-host.mjs
+	node tools/smoke-host.mjs --large
 
 bench:
 	go test -tags debug ./internal/guard -run '^$$' -bench BenchmarkWarmReplay -benchmem

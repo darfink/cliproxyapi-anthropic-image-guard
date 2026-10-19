@@ -2,10 +2,14 @@ package guard
 
 import (
 	"bytes"
+	"encoding/base64"
+	"encoding/json"
+	"image"
+	"io"
 	"os"
+	"sort"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/tidwall/gjson"
 )
@@ -21,62 +25,170 @@ func TestCapturedRequestReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	verifyCapturedReplay(t, body)
+}
+
+func TestCapturedRolloutReplay(t *testing.T) {
+	path := os.Getenv("IMAGE_GUARD_REPLAY_ROLLOUT")
+	if path == "" {
+		t.Skip("set IMAGE_GUARD_REPLAY_ROLLOUT for a private offline history replay")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	decoder := json.NewDecoder(f)
+	var items []json.RawMessage
+	for {
+		var record struct {
+			Type    string          `json:"type"`
+			Payload json.RawMessage `json:"payload"`
+		}
+		if err := decoder.Decode(&record); err == io.EOF {
+			break
+		} else if err != nil {
+			t.Fatal("invalid private history JSON")
+		}
+		if record.Type == "compacted" {
+			items = nil
+		} else if record.Type == "response_item" {
+			items = append(items, record.Payload)
+		}
+	}
+	body, err := json.Marshal(map[string]any{"model": "claude-opus-5-5", "input": items})
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifyCapturedReplay(t, body)
+}
+
+func verifyCapturedReplay(t *testing.T, body []byte) {
+	t.Helper()
 	g, err := New(DefaultConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
-	start := time.Now()
 	out, err := g.Rewrite(body)
 	if err != nil {
 		t.Fatal(err)
 	}
-	cold := time.Since(start)
-	start = time.Now()
+	if out == nil {
+		out = body
+	}
+	if !gjson.ValidBytes(out) {
+		t.Fatal("invalid repaired JSON")
+	}
 	warm, err := g.Rewrite(body)
+	if err != nil || (warm != nil && !bytes.Equal(out, warm)) {
+		t.Fatal("warm replay changed image history")
+	}
+	cold, err := New(DefaultConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
-	warmDuration := time.Since(start)
-	if !bytes.Equal(warm, out) {
-		t.Fatal("warm replay changes request bytes")
+	restarted, err := cold.Rewrite(body)
+	if err != nil || (restarted != nil && !bytes.Equal(out, restarted)) {
+		t.Fatal("restart changed image history")
 	}
-	var collect func(gjson.Result) []gjson.Result
-	collect = func(v gjson.Result) (images []gjson.Result) {
-		if v.Get("type").Str == "input_image" && strings.HasPrefix(v.Get("image_url").Str, "data:image/") {
-			return []gjson.Result{v.Get("image_url")}
+	var originals []historyImage
+	var restore []edit
+	removed := 0
+	var walk func(gjson.Result, gjson.Result)
+	walk = func(before, after gjson.Result) {
+		url := before.Get("image_url")
+		if before.Get("type").Str == "input_image" && strings.HasPrefix(url.Str, "data:image/") {
+			wireBytes := len(before.Raw)
+			comma := strings.IndexByte(url.Str, ',')
+			normal, err := g.normalize(url.Str[comma+1:])
+			if err != nil {
+				t.Fatal("private image normalization failed")
+			}
+			if normal.changed {
+				encoded, _ := json.Marshal(dataURL(normal.format, normal.data))
+				wireBytes += len(encoded) - len(url.Raw)
+			}
+			originals = append(originals, historyImage{bytes: wireBytes})
+			if after.Get("type").Str == "input_text" && after.Get("text").Str == omittedImage {
+				removed++
+			} else {
+				newURL := after.Get("image_url").Str
+				if !strings.HasPrefix(newURL, "data:image/") {
+					t.Fatal("image was not retained or replaced with a placeholder")
+				}
+				split := strings.IndexByte(newURL, ',')
+				config, _, err := image.DecodeConfig(base64.NewDecoder(base64.StdEncoding, strings.NewReader(newURL[split+1:])))
+				if err != nil || config.Width > 2000 || config.Height > 2000 {
+					t.Fatal("retained private image has invalid dimensions")
+				}
+				if !normal.changed && before.Raw != after.Raw {
+					t.Fatal("retained small image changed")
+				}
+			}
+			if before.Get("cache_control").Raw != after.Get("cache_control").Raw {
+				t.Fatal("private image cache marker changed")
+			}
+			if before.Raw != after.Raw {
+				restore = append(restore, edit{after.Index, after.Index + len(after.Raw), []byte(before.Raw)})
+			}
+			return
 		}
-		if v.IsArray() || v.IsObject() {
-			v.ForEach(func(_, child gjson.Result) bool { images = append(images, collect(child)...); return true })
+		if before.IsArray() {
+			b, a := before.Array(), after.Array()
+			if len(b) != len(a) {
+				t.Fatal("private history positions changed")
+			}
+			for i := range b {
+				walk(b[i], a[i])
+			}
+		} else if before.IsObject() {
+			a := after.Map()
+			before.ForEach(func(key, child gjson.Result) bool { walk(child, a[key.Str]); return true })
 		}
-		return
 	}
-	before := collect(gjson.ParseBytes(body))
-	after := collect(gjson.ParseBytes(out))
-	if len(before) <= 20 || len(before) != len(after) {
-		t.Fatal("expected an unchanged many-image request")
+	walk(gjson.ParseBytes(body), gjson.ParseBytes(out))
+	if len(originals) <= 20 {
+		t.Fatal("expected a many-image history")
 	}
-	restored := append([]byte{}, out...)
-	changed := 0
-	expectedChanges := 0
-	for i, image := range after {
-		original, _ := decodedImage(t, before[i].Str)
-		if original.Bounds().Dx() > 2000 || original.Bounds().Dy() > 2000 {
-			expectedChanges++
-		}
-		decoded, _ := decodedImage(t, image.Str)
-		if decoded.Bounds().Dx() > 2000 || decoded.Bounds().Dy() > 2000 {
-			t.Fatal("oversized image remains")
-		}
-		if image.Raw != before[i].Raw {
-			changed++
-			restored = bytes.Replace(restored, []byte(image.Raw), []byte(before[i].Raw), 1)
-		}
+	sort.Slice(restore, func(i, j int) bool { return restore[i].start < restore[j].start })
+	var restored bytes.Buffer
+	position := 0
+	for _, e := range restore {
+		restored.Write(out[position:e.start])
+		restored.Write(e.value)
+		position = e.end
 	}
-	if changed == 0 || changed != expectedChanges || !bytes.Equal(restored, body) {
-		t.Fatalf("changed=%d expected=%d unrelated-bytes-preserved=%t", changed, expectedChanges, bytes.Equal(restored, body))
+	restored.Write(out[position:])
+	if !bytes.Equal(restored.Bytes(), body) {
+		t.Fatal("bytes outside private image blocks changed")
 	}
 	if again, err := g.Rewrite(out); err != nil || again != nil {
-		t.Fatalf("already repaired history changed: %v", err)
+		t.Fatal("repaired private history was not idempotent")
 	}
-	t.Logf("images=%d resized=%d cold=%s warm=%s; all other bytes unchanged", len(before), changed, cold, warmDuration)
+	var events []int
+	lastRemoved := 0
+	for n := 1; n <= len(originals); n++ {
+		evicted, err := imageEvictions(originals[:n])
+		if err != nil {
+			t.Fatal(err)
+		}
+		count := 0
+		for _, value := range evicted {
+			if value {
+				count++
+			}
+		}
+		if count != lastRemoved {
+			if len(events) > 0 && events[len(events)-1] == n-1 {
+				t.Fatal("private screenshots caused eviction on consecutive additions")
+			}
+			events = append(events, n)
+		}
+		lastRemoved = count
+	}
+	if removed != lastRemoved || (removed > 0 && len(out) >= 30_000_000) {
+		t.Fatal("private history did not fit with provider headroom")
+	}
+	t.Logf("images=%d evicted=%d retained=%d bytes=%d->%d eviction-additions=%v; warm/cold/idempotent; all non-image bytes preserved",
+		len(originals), removed, len(originals)-removed, len(body), len(out), events)
 }

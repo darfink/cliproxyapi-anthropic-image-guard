@@ -9,15 +9,32 @@ import { join, resolve } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 const binary = process.env.CLIPROXYAPI_BINARY ?? '/opt/homebrew/opt/cliproxyapi/bin/cliproxyapi';
-const library = resolve(process.argv[2] ?? 'dist/anthropic-image-guard.dylib');
+const args = process.argv.slice(2);
+const huge = args.includes('--huge');
+const large = huge || args.includes('--large');
+assert(args.every(arg => !arg.startsWith('--') || ['--large', '--huge'].includes(arg)), 'Unknown option');
+const library = resolve(args.find(arg => !arg.startsWith('--')) ?? 'dist/anthropic-image-guard.dylib');
+const testText = 'local test only';
+const timeout = huge ? 180000 : large ? 90000 : 15000;
 const png = 'iVBORw0KGgoAAAANSUhEUgAAB9EAAAACCAYAAADvqyztAAAACXBIWXMAAAPoAAAD6AG1e1JrAAAAcElEQVRoge3TQQ0AAAgDMeRMJkEiikjQ0ccMXLrKbJsGDDDAAAMMMMAAAwwwwAADDDDAAAMMMMAAAwwwwAADDDDAAAPRoEsER2CAAQYYYIABBhhggAEGGGCAAQYYYIABBhhggAEGGGCAAQYYYGC/wQGYFgdKlUg1AgAAAABJRU5ErkJggg==';
+// Already-small lossless WebP, also covered by the Go format tests. Padding
+// exercises a large wire payload without large pixel allocations or resizing.
+const webp = Buffer.from('UklGRiQAAABXRUJQVlA4TBcAAAAvf8EFEAdQwaJUuoBhABLC//1SRP9TPwA=', 'base64');
+const encoded = large ? Buffer.concat([webp, Buffer.alloc((1 << 20) / 4 * 3 - webp.length)]).toString('base64') : png;
+const media = large ? 'image/webp' : 'image/png';
+const count = huge ? 200 : large ? 65 : 21;
+const retainedCount = huge ? 13 : large ? 10 : 21;
+const expectedCalls = huge ? 1 : 4;
 const seen = [];
 const mock = createServer(async (req, res) => {
   try {
     assert.equal(req.url.split('?')[0], '/v1/messages');
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
-    const body = JSON.parse(Buffer.concat(chunks));
+    const raw = Buffer.concat(chunks);
+    assert(raw.length <= 32_000_000, `Provider's 32 MB request cap exceeded: ${raw.length}`);
+    const body = JSON.parse(raw);
+    assert.equal(body.messages[0].content.at(-1).text, testText, 'Text changed during interception or translation');
     const images = [];
     const walk = value => {
       if (!value || typeof value !== 'object') return;
@@ -28,9 +45,14 @@ const mock = createServer(async (req, res) => {
       }
     };
     walk(body.messages);
-    assert.equal(images.length, 21);
+    assert.equal(images.length, retainedCount);
+    if (large) assert(raw.includes(Buffer.from('[Earlier image omitted to keep this request within image limits.]')));
     for (const image of images) {
-      assert.equal(image.media_type, 'image/png');
+      assert.equal(image.media_type, media);
+      if (large) {
+        assert.equal(image.data, encoded, 'Retained image bytes changed');
+        continue;
+      }
       const bytes = Buffer.from(image.data, 'base64');
       assert.equal(bytes.readUInt32BE(16), 2000);
       assert(bytes.readUInt32BE(20) <= 2000);
@@ -99,28 +121,31 @@ try {
     await sleep(100);
   }
   assert(ready, `Host did not start: ${output}`);
-  for (const route of ['messages', 'responses']) {
-    for (const stream of [false, true]) {
-      const image = route === 'messages' ? { type: 'image', source: { type: 'base64', media_type: 'image/png', data: png } } : { type: 'input_image', image_url: 'data:image/png;base64,' + png };
-      const content = [...Array.from({ length: 21 }, () => image), { type: route === 'messages' ? 'text' : 'input_text', text: 'local test only' }];
+  for (const route of huge ? ['responses'] : ['messages', 'responses']) {
+    for (const stream of huge ? [true] : [false, true]) {
+      const image = route === 'messages' ? { type: 'image', source: { type: 'base64', media_type: media, data: encoded } } : { type: 'input_image', image_url: 'data:' + media + ';base64,' + encoded };
+      const content = [...Array.from({ length: count }, () => image), { type: route === 'messages' ? 'text' : 'input_text', text: testText }];
       const body = { model: 'guard-test', stream, max_tokens: 32, [route === 'messages' ? 'messages' : 'input']: [{ role: 'user', content }] };
-      const response = await fetch(`http://127.0.0.1:${port}/v1/${route}`, { method: 'POST', headers, body: JSON.stringify(body), signal: AbortSignal.timeout(15000) });
+      const payload = JSON.stringify(body);
+      if (large) assert(Buffer.byteLength(payload) > 64 << 20);
+      if (huge) assert(Buffer.byteLength(payload) * 4 / 3 > 256 << 20, 'Must exceed the old RPC-envelope cap');
+      const response = await fetch(`http://127.0.0.1:${port}/v1/${route}`, { method: 'POST', headers, body: payload, signal: AbortSignal.timeout(timeout) });
       const text = await response.text();
       assert.equal(response.status, 200, `${route} stream=${stream}: ${text}\n${output}`);
       assert(text.includes('ok'), `Missing mock result: ${text}`);
     }
   }
-  assert.equal(seen.length, 4);
+  assert.equal(seen.length, expectedCalls);
   // The host can use upstream streaming internally for a non-streaming Responses call.
-  assert(seen.filter(x => x.stream).length >= 2);
+  assert(seen.filter(x => x.stream).length >= (huge ? 1 : 2));
   for (const stream of [false, true]) {
     const body = { model: 'guard-test', stream, input: [{ role: 'user', content: [{ type: 'input_image', image_url: 'data:image/png;base64,%%%' }] }] };
-    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, { method: 'POST', headers, body: JSON.stringify(body), signal: AbortSignal.timeout(15000) });
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, { method: 'POST', headers, body: JSON.stringify(body), signal: AbortSignal.timeout(timeout) });
     assert.equal(response.status, 400);
-    assert((await response.text()).includes('Anthropic image guard'));
+    assert((await response.text()).includes('Anthropic image guard: inline image has invalid base64 data'));
   }
-  assert.equal(seen.length, 4, 'Rejected requests must never reach the model endpoint.');
-  console.log('PASS: stock host loaded the native plugin; Messages/Responses x streaming/non-streaming; 21 images resized; replay bytes stable; unsafe images rejected before execution; no external API calls.');
+  assert.equal(seen.length, expectedCalls, 'Rejected requests must never reach the model endpoint.');
+  console.log(`PASS: ${large ? `>${huge ? 199 : 64} MiB image history reduced from ${count} to ${retainedCount} images; ` : '21 images resized; '}stock native host; ${huge ? 'Responses streaming, >256 MiB RPC' : 'Messages/Responses x streaming/non-streaming'}; provider 32 MB cap enforced; replay bytes stable; text unchanged; unsafe images rejected; no external API calls.`);
 } finally {
   if (host && host.exitCode === null && host.signalCode === null) {
     host.kill('SIGTERM');

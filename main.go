@@ -28,6 +28,19 @@ var manager = plugin.New()
 
 func main() {}
 
+// The host owns this buffer and keeps it valid until imageGuardCall returns.
+// Handle only reads it and JSON decoding copies retained values. Borrowing the
+// bytes avoids another full RPC-envelope copy and the C.int size restriction.
+func borrowRequest(ptr unsafe.Pointer, size uint64) ([]byte, bool) {
+	if size > uint64(^uint(0)>>1) || (size > 0 && ptr == nil) {
+		return nil, false
+	}
+	if size == 0 {
+		return nil, true
+	}
+	return unsafe.Slice((*byte)(ptr), int(size)), true
+}
+
 //export cliproxy_plugin_init
 func cliproxy_plugin_init(host *C.cliproxy_host_api, api *C.cliproxy_plugin_api) C.int {
 	if host == nil || api == nil || host.abi_version != C.uint32_t(pluginabi.ABIVersion) {
@@ -46,13 +59,12 @@ func imageGuardCall(method *C.char, request *C.uint8_t, size C.size_t, response 
 		return 1
 	}
 	response.ptr, response.len = nil, 0
-	// Bound size_t before conversion to C.int. This plugin has no host callbacks.
-	if method == nil || size > 256<<20 || (size > 0 && request == nil) {
+	if method == nil {
 		return 1
 	}
-	var raw []byte
-	if size > 0 {
-		raw = C.GoBytes(unsafe.Pointer(request), C.int(size))
+	raw, ok := borrowRequest(unsafe.Pointer(request), uint64(size))
+	if !ok {
+		return 1
 	}
 	out := manager.Handle(C.GoString(method), raw)
 	if len(out) > 0 {

@@ -72,7 +72,7 @@ func (m *Manager) Handle(method string, raw []byte) (out []byte) {
 		return envelope(map[string]any{
 			"schema_version": pluginabi.SchemaVersion,
 			"metadata": pluginapi.Metadata{
-				Name: ID, Version: "0.1.0", Author: "darfink",
+				Name: ID, Version: "0.2.0", Author: "darfink",
 				GitHubRepository: "https://github.com/darfink/cliproxyapi-anthropic-image-guard",
 				ConfigFields: []pluginapi.ConfigField{
 					{Name: "max-edge", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum image edge in pixels. Default: 2000. Range: 256..2000."},

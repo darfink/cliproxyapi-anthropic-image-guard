@@ -315,7 +315,7 @@ func TestCacheByteBudget(t *testing.T) {
 }
 
 func TestLargeTextOnlyRequestIsNotLimited(t *testing.T) {
-	body := append([]byte(`{"input":"`), bytes.Repeat([]byte("x"), maxRequestBytes)...)
+	body := append([]byte(`{"input":"`), bytes.Repeat([]byte("x"), 64<<20)...)
 	body = append(body, []byte(`"}`)...)
 	out, err := fixtureGuard(t).Rewrite(body)
 	if err != nil || out != nil {

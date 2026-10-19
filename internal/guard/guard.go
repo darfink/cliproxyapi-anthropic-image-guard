@@ -12,6 +12,7 @@ import (
 	"image"
 	"image/jpeg"
 	"image/png"
+	"io"
 	"sort"
 	"strings"
 	"sync"
@@ -20,8 +21,6 @@ import (
 	"github.com/tidwall/gjson"
 	_ "golang.org/x/image/webp"
 )
-
-const maxRequestBytes = 64 << 20
 
 // Config controls image dimensions and bounded in-process resources.
 type Config struct {
@@ -86,30 +85,53 @@ type edit struct {
 	value      []byte
 }
 
-// Rewrite returns nil when no image changes. Only JSON string spans for image
-// bytes and media types are replaced; text, tools, cache_control and key order stay intact.
+func replacementEdit(body []byte, v gjson.Result, value []byte) (edit, error) {
+	if v.Index < 0 || v.Index+len(v.Raw) > len(body) || !bytes.Equal(body[v.Index:v.Index+len(v.Raw)], []byte(v.Raw)) {
+		return edit{}, errors.New("image guard could not locate an image field safely")
+	}
+	return edit{v.Index, v.Index + len(v.Raw), value}, nil
+}
+
+// Rewrite returns nil when no image changes. Retained images keep their encoded
+// bytes; eviction replaces whole image blocks with stable text placeholders.
+// All bytes outside those blocks and resized image fields stay intact.
 func (g *Guard) Rewrite(body []byte) ([]byte, error) {
 	if !gjson.ValidBytes(body) {
 		return nil, errors.New("image guard requires a valid JSON request")
 	}
-	root := gjson.ParseBytes(body)
 	var edits []edit
+	var images []historyImage
 	var visitErr error
 	add := func(v gjson.Result, s string) {
 		if visitErr != nil {
 			return
 		}
-		if v.Type != gjson.String || v.Index < 0 || v.Index+len(v.Raw) > len(body) || !bytes.Equal(body[v.Index:v.Index+len(v.Raw)], []byte(v.Raw)) {
+		if v.Type != gjson.String {
 			visitErr = errors.New("image guard could not locate an image field safely")
 			return
 		}
 		encoded, _ := json.Marshal(s)
-		edits = append(edits, edit{v.Index, v.Index + len(v.Raw), encoded})
+		change, err := replacementEdit(body, v, encoded)
+		if err != nil {
+			visitErr = err
+			return
+		}
+		edits = append(edits, change)
 	}
 	visit := func(block gjson.Result) {
 		if visitErr != nil {
 			return
 		}
+		image := historyImage{block: block, bytes: len(block.Raw), firstEdit: len(edits), protected: block.Get("type").Str == "computer_screenshot"}
+		defer func() {
+			if visitErr == nil {
+				image.lastEdit = len(edits)
+				for _, e := range edits[image.firstEdit:image.lastEdit] {
+					image.bytes += len(e.value) - (e.end - e.start)
+				}
+				images = append(images, image)
+			}
+		}()
 		var data, media gjson.Result
 		isURL := false
 		switch block.Get("type").Str {
@@ -139,10 +161,6 @@ func (g *Guard) Rewrite(body []byte) ([]byte, error) {
 				return
 			}
 			encoded = encoded[comma+1:]
-		}
-		if len(body) > maxRequestBytes {
-			visitErr = errors.New("image guard request exceeds the 64 MiB processing limit")
-			return
 		}
 		result, err := g.normalize(encoded)
 		if err != nil {
@@ -195,10 +213,16 @@ func (g *Guard) Rewrite(body []byte) ([]byte, error) {
 			}
 		}
 	}
-	walk(root.Get("input"), 0)
-	walk(root.Get("messages"), 0)
+	// GetBytes copies only the selected container, not unrelated tools or metadata.
+	// Bound individual images below, not the size of the surrounding conversation.
+	walk(gjson.GetBytes(body, "input"), 0)
+	walk(gjson.GetBytes(body, "messages"), 0)
 	if visitErr != nil {
 		return nil, visitErr
+	}
+	edits, err := imageHistoryEdits(body, images, edits)
+	if err != nil {
+		return nil, err
 	}
 	if len(edits) == 0 {
 		return nil, nil
@@ -267,12 +291,21 @@ func (g *Guard) normalize(encoded string) (normalized, error) {
 	if len(encoded) > 16<<20 {
 		return normalized{}, errors.New("inline image exceeds the 16 MiB base64 processing limit")
 	}
-	raw, err := base64.StdEncoding.DecodeString(encoded)
-	if err != nil {
+	// NewDecoder validates each chunk separately. Reject data after padding even
+	// when the padding falls at a chunk boundary, as DecodeString did in v0.1.0.
+	if pad := strings.IndexByte(encoded, '='); pad >= 0 && strings.Trim(encoded[pad:], "=\r\n") != "" {
 		return normalized{}, errors.New("inline image has invalid base64 data")
 	}
-	config, format, err := image.DecodeConfig(bytes.NewReader(raw))
-	if err != nil {
+	reader := base64.NewDecoder(base64.StdEncoding, strings.NewReader(encoded))
+	config, format, headerErr := image.DecodeConfig(reader)
+	// Header decoding can stop early. Validate the entire base64 stream, including
+	// trailing data, without retaining a second full copy of the image.
+	_, err := io.Copy(io.Discard, reader)
+	var corrupt base64.CorruptInputError
+	if err != nil || errors.As(headerErr, &corrupt) {
+		return normalized{}, errors.New("inline image has invalid base64 data")
+	}
+	if headerErr != nil {
 		return normalized{}, errors.New("inline image has an unsupported or invalid image header")
 	}
 	if config.Width <= g.cfg.MaxEdge && config.Height <= g.cfg.MaxEdge {
@@ -284,7 +317,8 @@ func (g *Guard) normalize(encoded string) (normalized, error) {
 		return normalized{}, fmt.Errorf("image exceeds the %d-pixel decode budget; crop or resize it first", g.cfg.MaxDecodePixels)
 	}
 	// Apply EXIF orientation before re-encoding, which removes EXIF metadata.
-	decoded, err := imaging.Decode(bytes.NewReader(raw), imaging.AutoOrientation(true))
+	reader = base64.NewDecoder(base64.StdEncoding, strings.NewReader(encoded))
+	decoded, err := imaging.Decode(reader, imaging.AutoOrientation(true))
 	if err != nil {
 		return normalized{}, errors.New("inline image could not be decoded safely")
 	}
